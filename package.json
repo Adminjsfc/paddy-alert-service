@@ -1,0 +1,28 @@
+{
+  "name": "paddy-gps-alert-service",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Shipment GPS alerts for Paddy and CMR, using the existing Paddy database and MQTT feed",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env scripts/control-service.js restart",
+    "dev": "node --watch --env-file-if-exists=.env gps_service.js",
+    "check:db": "node --env-file-if-exists=.env scripts/check-db.js",
+    "scan": "node --env-file-if-exists=.env scripts/scan.js",
+    "test": "node --test",
+    "verify:db": "node --env-file-if-exists=.env scripts/verify-db.js",
+    "geometry:set": "node --env-file-if-exists=.env scripts/configure-geometry.js",
+    "db:setup": "node --env-file-if-exists=.env scripts/setup-db.js",
+    "restart": "node --env-file-if-exists=.env scripts/control-service.js restart",
+    "stop": "node --env-file-if-exists=.env scripts/control-service.js stop",
+    "service:status": "node --env-file-if-exists=.env scripts/control-service.js status"
+  },
+  "dependencies": {
+    "ioredis": "^6.0.0",
+    "mqtt": "^5.14.1",
+    "mysql2": "^3.15.3"
+  }
+}

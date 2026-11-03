@@ -1,0 +1,6 @@
+services:
+  paddy-gps-alerts:
+    build: .
+    env_file: .env
+    restart: unless-stopped
+    stop_grace_period: 35s
