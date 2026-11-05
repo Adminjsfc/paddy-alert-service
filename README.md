@@ -47,6 +47,46 @@ history. This worker handles alerts. Run the two workers alongside each other
 with distinct MQTT client IDs. Existing endpoint distances suppress halt/off-route
 checks while loading/unloading; they never generate GF alerts.
 
+## Alert notifications
+
+Each saved alert creates one shared `tbl_notifications` row (title, message,
+event_key, shipment reference, district and vehicle). The separate
+`tbl_notification_details` table stores notification_id, user_id, user_source,
+is_read/read_at and published_at for each recipient. Content is not copied for
+each user. Event keys and recipient unique keys prevent duplicate rows and retries
+do not reset read state.
+
+Recipients follow the shipment route. PACS/LAMPS to Miller alerts go to active
+main-backend State users (user_type=2) plus active Paddy MILLER accounts whose
+facility_id matches that shipment's Miller facility (legacy miller_id-only
+accounts are supported too; conflicting links are excluded). Miller to Godown/FCI alerts additionally go to
+active destination receiving users (core user_type 4/8) with an active assignment
+to that exact core store and destination district. District-only DM assignments,
+other Millers, unrelated stores and inactive users are excluded. Both flows also
+notify the active DRIVER user referenced by shipments.driver_user_id. Other
+drivers at the same facility are excluded; driver name/phone alone are not used
+to guess an account.
+CORE_DB_* settings configure the core read connection. user_source=CORE/PADDY
+prevents equal numeric IDs from colliding. Recipient caching is per shipment,
+not per district. A Godown requires core_store_location_id on the shipment or
+core_store_id on the destination facility; missing mapping never picks a random
+store. State and Miller still receive the notification if that mapping is absent.
+`npm.cmd run verify:recipients` checks both flows using temporary SQL fixtures.
+`npm.cmd run notification:check` reports current running-trip recipients and
+missing Miller/store/user mappings. New alert processing also logs
+NOTIFICATION_RECIPIENT_MISSING with the specific reason instead of silently
+omitting a required recipient. No substitute account or unrelated store is chosen.
+
+Alert details, notifications, recipient rows and the outbox completion marker
+commit together. After commit, the worker publishes each pending recipient to
+Redis channel `paddy:notification:new`. A failed publish leaves published_at NULL
+for retry. Consumers should deduplicate using delivery_id; a Redis publish is not
+an acknowledgement that a device received or read the message. A Paddy socket
+consumer must subscribe to that channel to display real-time notifications.
+It deliberately does not publish Paddy notification IDs into the core channel.
+No external app message is sent by DB verification; temporary notification rows
+are rolled back. Historical processed alerts are not broadcast again.
+
 ## Setup
 
 Node 24, the existing Paddy MySQL/MariaDB database, Redis and MQTT are required.
@@ -61,13 +101,17 @@ npm.cmd run check:db
 npm.cmd start
 ```
 
-`db:setup` runs the adjacent `paddy/scripts/migrate.js` using this service's
+`db:setup` runs the adjacent `Paddy-backend/scripts/migrate.js` using this service's
 loaded `DB_*` settings. Migration **046** renames the old details table while
 preserving its data and creates event/outbox tables. Migration **047** removes
 `vehicle_id` from both details and events and adds per-alert metrics. Migration **048** removes the event path column. Vehicle identity is resolved through `shipment_id` and `vehicle_no`.
 For container deployment,
 run migrations from the backend/host before starting the worker; external DB,
 Redis and MQTT hosts must be reachable from the container.
+
+It also inserts missing alert-master defaults without replacing existing timings.
+Startup/readiness reject missing or mismatched master IDs. Keep the MQTT client ID
+distinct from paddy-trip and paddy-lastLocation. Local `.env` is ignored by Git.
 
 Configure:
 
@@ -108,8 +152,18 @@ Paddy uses `shipment_id` for trip identity. Detail rows link to their event with
 `alert_event_id`. A sustained condition opens one event at its configured threshold.
 Subsequent packets update that event's duration/location. Recovery closes it;
 an additional episode opens a new event. Reminder details link to the same event.
-Online/ignition-on are instantaneous, closed events. Shipment completion also
-closes outstanding condition events. Event `status=1` means open, `status=0` closed.
+Online/ignition-on are instantaneous, closed conditions. Event `status=1` means
+the condition remains open, `status=0` means recovered or trip-finished.
+Event end_date_time is the alert's own recovery time, even while the vehicle
+continues its trip. Offline ends on fresh communication, overspeed on normal
+speed, halt on movement, and off-route on returning to the route. Trip completion
+at the destination geofence is separate (shipments.trip_completed_at). It only
+finishes unresolved alert episodes and never replaces existing recovery times.
+duration_minutes tracks the alert episode. Old progress cannot reopen a closed
+condition. `npm.cmd run verify:completion` tests both lifecycles in temporary tables.
+Progress SQL updates only an open event (status=1 and end_date_time IS NULL).
+After recovery, replayed or later progress for that same episode cannot change
+its duration, speed, coordinates or recovery timestamp.
 Detail `status` remains its reporting status. SQL timestamps are UTC.
 
 Both details and events store `duration_minutes` and `ignition_status`.
@@ -143,11 +197,10 @@ without locking the batch writer's job. Queue recovery prevents duplicate delive
 
 ## Location and column usage
 
-Migration 049 adds/backfills block_id on details and district_id/block_id on events
-from the shipment source facility metadata. Pending older queue jobs resolve
-missing block information before insertion. These are administrative source IDs,
-not the moving vehicle's reverse-geocoded location. Reports accept district_id
-and block_id filters.
+Shipment and alert location use district_id. Block columns were removed from
+alert details/events by migration 095. New queue payloads and SQL inserts contain
+only district metadata. Older queue payloads remain processable because unused
+legacy fields are not inserted into the current tables.
 
 Duration, speed, ignition and per-type metrics are populated by the worker for
 applicable alerts; unrelated per-type fields remain NULL. Detail metrics are a
@@ -160,29 +213,54 @@ The created_by field is nullable for worker-generated records. Migration 053 rem
 
 | ID | Code | Trigger |
 | --- | --- | --- |
-| 2 | LH | Speed <= 1 kph for 3 minutes in transit, outside both endpoints |
+| 2 | LH | Speed <= 1 kph outside endpoints, alerts at alert_time and 2 x alert_time minutes |
 | 3 | DO | No fresh live packet for 30 minutes after dispatch |
-| 5 | OR | More than 200 metres from the configured actual route |
+| 5 | OR | Increasing route deviation reaches configured metre milestones, currently 200/500/1000 |
 | 6 | DD | Expected completion passed before GPS arrival |
-| 7 | OS | Speed > 50 kph |
+| 7 | OS | Speed > alert_time km/h, currently 50, immediate once until speed recovers |
 | 8 | SFN | Ten-minute live-packet gap or sustained explicit network searching |
 | 9 | DISC | No fresh live packet for 1,440 minutes |
-| 12 | IDL | Ignition on, speed <= 1 kph for 10 minutes in transit |
+| 12 | IDL | Ignition on, speed < 1 kph for alert_time minutes, currently 10 |
 | 13 | IGN_OFF | Explicit ignition-off state |
 | 14 | IGN_ON | Explicit transition from ignition off to on |
 | 15 | ONL | Fresh telemetry after an emitted SFN/DO/DISC alert |
 | 16 | ON_ROUTE | Returns within the route threshold after an emitted Off Route alert |
 
-`alert_time` is minutes; `threshold_value` uses `threshold_unit` (kph/metres).
-`alert_reminder_time=NULL` means one detail per episode; a positive value enables
-repeat details. `status=0` disables an enabled type. New master rows default to a
-five-minute reminder; existing rows retain configured values. `alert_interval`
-is retained for compatibility and is not used by the engine. The master API
-also exposes `active` as a compatibility alias of `status`.
+Alert configuration follows the reference GpsService and is read from gps_alert_master:
+
+- OS: alert_time is a positive speed limit in km/h, not a duration.
+- OR: alert_time, alert_reminder_time and alert_interval are successive distance milestones in metres. At most three alerts are sent, and distance must increase between alerts. Returning below the first milestone closes the episode.
+- All three Off Route details link to one Off Route event. While off-route, duration/distance update that event. Recovery adds one On Route detail linked to the same closed event, without inserting a separate On Route event. Repeated on-route packets add nothing. A later departure creates a new episode and resets its milestone count.
+- LH: alert_time must be positive minutes. Exactly two notifications occur at T and 2T, with event progress updates between them.
+- IDL, SFN, DO and DISC: alert_time must be positive minutes. A zero/invalid setting suppresses the condition. One notification is sent until recovery.
+- IGN_OFF: alert_time is a nonnegative minute duration. Zero/null permits an immediate alert. IGN_ON remains a transition notification.
+- DD is a Paddy-specific ETA condition using alert_time in minutes. It emits once per continuous delay episode and updates that event's duration on subsequent scans, even if a legacy reminder value remains configured. Migration 098 clears its reminder fields. On-route recovery is a separate OR/ON_ROUTE lifecycle and does not cancel an overdue ETA.
+
+No alert threshold environment variables or separate speed/distance defaults are used. Migration 092 copies the reference master's current values by alert code, preserving Paddy's distinct numeric IDs and excluded types. The GpsService source/database is read only during this one-time alignment, not at worker runtime. Further configuration changes are read from the Paddy table. `status=0` disables a type.
 
 No-fix packets cannot assert motion, halt or route position. Missing ignition
 is unknown. Historical packets do not recover the live-device offline clock.
-SFN is a communication-gap warning, not a cellular diagnosis. Notification sending is not configured.
+SFN is a communication-gap warning, not a cellular diagnosis. Notification storage and Redis delivery follow the recipient flow described above.
+
+Fresh, non-retained LGN/HEL/HBT packets also count as device communication after
+vehicle/IMEI mapping validation. Their recent server_date_time updates only the
+communication clock and closes network/offline/disconnected episodes, with an
+Online recovery notification where applicable. They do not update GPS position,
+speed, ignition, trip start or the PVT packet watermark. Historical/stale/retained
+presence packets cannot mark a device online. Redis position cache remains PVT-only.
+Event-table coordinates are not stored: start/end latitude/longitude columns
+were removed in migration 097. Alert-detail coordinates and GPS processing remain
+available for route and location rules.
+Event progress ordering uses the episode's monotonic duration; the redundant
+last-sample column is not stored. Notifications link alerts by event_key.
+
+For an already-running shipment with missing dispatch/start timestamps and no
+processed live packet, communication monitoring initializes once from the latest
+valid persisted trip/creation/GPS timestamp. This fallback does not populate trip
+start or ETA, reset lastLiveAt, or advance an existing outage clock on restart.
+Source-device last GPS timestamps may seed that initial clock even when no valid
+coordinates are available. IMEI mismatches for running-trip packets are logged
+explicitly so an incorrect device mapping cannot remain silent.
 
 ## MQTT payload and route
 
@@ -232,7 +310,7 @@ GET /api/v1/reports/gps-alert-events?shipment_id=123&status=1
 ```
 
 Optional filters: `shipment_id`, `vehicle_id`, `alert_id`, `season_id`,
-`facility_id` (source), `miller_id`, `district_id`, `block_id`, `status`, ISO `from`, exclusive `to`.
+`facility_id` (source), `miller_id`, `district_id`, `status`, ISO `from`, exclusive `to`.
 PACS/LAMPS, Miller and transporter reports retain their shipment scope.
 ADMIN/OPERATOR may view all. Miller reports require dashboard view permission.
 Event time filtering uses `start_date_time`; detail filtering uses `last_date_time`.
@@ -270,4 +348,4 @@ Scheduled alerts with no packet/state coordinates use the last valid known posit
 
 Migration 057 renumbers existing event IDs in order and preserves detail links through ON UPDATE CASCADE. Existing events are updated directly; INSERT runs only for a new episode, so progress updates do not consume auto-increment IDs. Verification uses session-only temporary copies of event/details/outbox tables and does not advance production counters. Auto-increment may still have gaps after a failed real insert or rollback.
 
-Migration 065 adds ON_ROUTE recovery. Returning to the saved polyline closes the off-route episode and emits one recovery notification. Missing GPS fix or geometry does not prove recovery. The default off-route threshold is 200 metres, configured in gps_alert_master.
+Migration 065 adds ON_ROUTE recovery. Returning to the saved polyline closes the off-route episode and emits one recovery notification. Missing GPS fix or geometry does not prove recovery. The route distance limits are now the OR row's alert_time/alert_reminder_time/alert_interval values, as in GpsService.

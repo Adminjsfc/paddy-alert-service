@@ -5,6 +5,9 @@ import {createRedis} from './src/config/redis.js';
 import {RedisRepository} from './src/repositories/RedisRepository.js';
 import {startBatchWorker} from './src/services/AlertBatchService.js';
 import {acquireServiceLock} from './src/helpers/service-lock.js';
+import {assertAlertMaster} from './src/config/alert-master.js';
+import {verifyRecipientSource} from './src/repositories/NotificationRecipientsRepository.js';
+import {closeCoreDatabase} from './src/config/core-database.js';
 
 const pool=createPool(),redisClient=createRedis(),redis=new RedisRepository(redisClient);
 let subscriber,scheduler,batchWorker,serviceLock,stopping=false;
@@ -16,11 +19,14 @@ async function shutdown(code=0){
   try {await batchWorker?.stop();}catch(error){log('ALERT_DRAIN_FAILED',{code:error.code||error.name});code=1;}
   try {await serviceLock?.release();}catch(error){log('SERVICE_LOCK_RELEASE_FAILED',{code:error.code||error.name});code=1;}
   redisClient.disconnect();
+  await closeCoreDatabase();
   await pool.end();clearTimeout(timeout);process.exitCode=code;
   if(process.connected)process.disconnect();
 }
 try {
-  await pool.query('SELECT status FROM gps_alert_master LIMIT 1');
+  if(!process.env.MQTT_URL)throw new Error('Set MQTT_URL in .env before starting the alert subscriber');
+  const [master]=await pool.query('SELECT id,alert_short_name,status FROM gps_alert_master');assertAlertMaster(master);
+  await verifyRecipientSource();
   await redisClient.connect();await redisClient.ping();
   const clientId=process.env.MQTT_CLIENT_ID||'paddy-gps-alerts';
   serviceLock=await acquireServiceLock(redisClient,`${redis.prefix}:service:${clientId}`,reason=>{

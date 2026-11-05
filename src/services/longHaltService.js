@@ -1,3 +1,3 @@
-export function process({active,departed,source,destination,packet,settings,at,condition}) {
-  condition('LH',active&&departed&&!source&&!destination&&packet.speed<=Number(settings.LH?.threshold_value??1),at);
+export function process({active,departed,source,destination,packet,at,condition}) {
+  condition('LH',active&&departed&&!source&&!destination&&packet.speed<=1,at);
 }

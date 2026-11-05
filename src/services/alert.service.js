@@ -15,6 +15,7 @@ export {excludedAlerts} from '../config/alerts.js';
 
 function isOldPacket(shipment,state,packet) {
   if(!packet)return false;
+  if(packet.presence_only)return state?.presenceWatermark!=null&&packet.timestamp<=state.presenceWatermark;
   return packet.timestamp<epoch(shipment.dispatched_at)
     || (state?.watermark!=null && packet.timestamp<=state.watermark);
 }
@@ -82,7 +83,13 @@ export function evaluate(shipment,previous,configs,packet,now=Date.now(),routeCo
   const active=isRunningTrip(shipment);
   const context={...routeContext,...lifecycle,shipment,state,packet,now,active,departed:active};
 
-  if(packet)processPacketRules(context);
+  if(packet?.presence_only){
+    state.presenceWatermark=packet.timestamp;
+    context.freshLive=active&&packet.live&&now-packet.timestamp<=Number(process.env.GPS_MAX_PACKET_GAP_MINUTES||5)*60000;
+    connectivity.process(context);
+    if(context.freshLive)context.condition('SFN',false,packet.timestamp);
+  }
+  else if(packet)processPacketRules(context);
   else processScheduledRules(context);
 
   return {state,alerts:lifecycle.alerts,events:lifecycle.events,result:'PROCESSED'};
