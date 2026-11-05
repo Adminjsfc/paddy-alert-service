@@ -1,0 +1,22 @@
+{
+  "notifications": [
+    {
+      "id": 1,
+      "alert_detail_id": 1
+    },
+    {
+      "id": 2,
+      "alert_detail_id": 2
+    }
+  ],
+  "events": [
+    {
+      "id": 1,
+      "last_sample_at": "2026-11-05 09:17:06"
+    },
+    {
+      "id": 2,
+      "last_sample_at": "2026-11-05 09:17:06"
+    }
+  ]
+}

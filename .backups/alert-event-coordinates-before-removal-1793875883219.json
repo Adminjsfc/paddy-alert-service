@@ -1,0 +1,23 @@
+[
+  {
+    "id": 1,
+    "start_lat": null,
+    "start_lng": null,
+    "end_lat": 23.8412514,
+    "end_lng": 86.4574814
+  },
+  {
+    "id": 2,
+    "start_lat": null,
+    "start_lng": null,
+    "end_lat": 23.8412514,
+    "end_lng": 86.4574814
+  },
+  {
+    "id": 3,
+    "start_lat": 23.8412514,
+    "start_lng": 86.4574814,
+    "end_lat": 23.8412514,
+    "end_lng": 86.4574814
+  }
+]
