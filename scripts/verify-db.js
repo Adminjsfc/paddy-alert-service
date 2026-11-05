@@ -31,7 +31,7 @@ try {
   finally {await replacementLock.release();}
   await connection.query("SET time_zone='+00:00'");
   // Session-only copies keep verification inserts out of real ID counters.
-  for(const table of ['tbl_vehicle_alert_event','tbl_vehicle_alerts_details','gps_alert_outbox']){
+  for(const table of ['tbl_vehicle_alert_event','tbl_vehicle_alerts_details','gps_alert_outbox','tbl_notifications','tbl_notification_details']){
     const [schema]=await connection.query(`SHOW CREATE TABLE ${table}`);
     const ddl=schema[0]['Create Table'].replace('CREATE TABLE','CREATE TEMPORARY TABLE')
       .replace(/^\s*CONSTRAINT .*FOREIGN KEY.*\n/gm,'').replace(/,\n\)/g,'\n)');
@@ -47,14 +47,17 @@ try {
   const packet={timestamp:now,latitude:23.5,longitude:85.5,speed:99,gps_fix:true,ignition:true,live:true,networkSearching:false};
   const opened=evaluate(shipment,{},configs,packet,now);
   assert(opened.alerts.some(a=>a.alert_id===7));
+  const notificationRecipients={recipientResolver:async()=>[
+    {user_id:7,user_source:'CORE'},{user_id:8,user_source:'CORE'},{user_id:7,user_source:'CORE'}
+  ]};
   async function deliver(result,p){
     const id=await alerts.save(connection,shipment,result,p);
     const row=await outbox.lock(connection,id),job={id,payload:row.payload};
     assert.equal(Number(await redis.publish(job)),1);assert.equal(Number(await redis.publish(job)),0);
     let batch=await redis.claim(10);assert.equal(batch.length,1);
     await redis.recover();batch=await redis.claim(10);assert.equal(batch.length,1);
-    assert.equal(await writeJob(connection,JSON.parse(batch[0])),true);
-    assert.equal(await writeJob(connection,JSON.parse(batch[0])),false);
+    assert.equal(await writeJob(connection,JSON.parse(batch[0]),notificationRecipients),true);
+    assert.equal(await writeJob(connection,JSON.parse(batch[0]),notificationRecipients),false);
     await redis.acknowledge(batch[0],id);
     assert.equal((await redis.getState(shipment.id)).revision,result.state.revision);
     const restored=await loadState(connection,shipment.id);
@@ -62,6 +65,19 @@ try {
     assert.equal(restored.watermark,result.state.watermark);
   }
   await deliver(opened,packet);
+  const [notifications]=await connection.query('SELECT id,title FROM tbl_notifications');
+  assert.equal(notifications.length,opened.alerts.length);
+  const [recipientRows]=await connection.query('SELECT notification_id,user_id,user_source,is_read FROM tbl_notification_details');
+  assert.equal(recipientRows.length,notifications.length*2);
+  assert(recipientRows.every(row=>row.user_source==='CORE'&&Number(row.is_read)===0));
+  await connection.execute('UPDATE tbl_notification_details SET is_read=1 WHERE user_id=7');
+  await alerts.insertDetails(connection,shipment,opened.alerts);
+  const notificationRepository=await import('../src/repositories/NotificationRepository.js');
+  await notificationRepository.save(connection,shipment,opened.alerts,await notificationRecipients.recipientResolver());
+  const [readRows]=await connection.query('SELECT is_read FROM tbl_notification_details WHERE user_id=7');
+  assert(readRows.every(row=>Number(row.is_read)===1));
+  const [notificationCount]=await connection.query('SELECT COUNT(*) n FROM tbl_notifications');
+  assert.equal(Number(notificationCount[0].n),notifications.length);
   assert.equal((await redis.getLatestPacket(shipment.vehicle_no)).timestamp,now);
   assert(await client.get(`${redis.prefix}:condition:${shipment.id}:OS`));
   const key=opened.events.find(e=>e.code==='OS').event_key;
@@ -69,7 +85,7 @@ try {
   assert.equal(Number(details[0].total),1);
   const progress=evaluate(shipment,opened.state,configs,{...packet,timestamp:now+60000},now+60000);
   await deliver(progress,{...packet,timestamp:now+60000});
-  const eventColumns='duration_minutes,end_date_time,status,block_id,district_id,max_speed,speed';
+  const eventColumns='duration_minutes,end_date_time,status,district_id,max_speed,speed';
   let [stored]=await connection.execute(`SELECT ${eventColumns} FROM tbl_vehicle_alert_event WHERE event_key=?`,[key]);
   assert.equal(Number(stored[0].duration_minutes),1);assert.equal(stored[0].end_date_time,null);
   const recovered=evaluate(shipment,progress.state,configs,{...packet,timestamp:now+120000,speed:20},now+120000);
@@ -80,10 +96,8 @@ try {
   await events.apply(connection,shipment,progress.events.find(e=>e.code==='OS'));
   [stored]=await connection.execute(`SELECT ${eventColumns} FROM tbl_vehicle_alert_event WHERE event_key=?`,[key]);
   assert.equal(Number(stored[0].status),0);assert(stored[0].end_date_time);assert.equal(Number(stored[0].duration_minutes),2);
-  assert.equal(stored[0].block_id,shipment.block_id??null);
   assert.equal(stored[0].district_id,shipment.district_id??null);
-  const [location]=await connection.execute('SELECT district_id,block_id FROM tbl_vehicle_alerts_details WHERE event_key=?',[opened.alerts.find(a=>a.code==='OS').event_key]);
-  assert.equal(location[0].block_id,shipment.block_id??null);
+  const [location]=await connection.execute('SELECT district_id FROM tbl_vehicle_alerts_details WHERE event_key=?',[opened.alerts.find(a=>a.code==='OS').event_key]);
   assert.equal(location[0].district_id,shipment.district_id??null);
   assert.equal(Number(stored[0].max_speed),99);assert.equal(Number(stored[0].speed),20);
   const route={geometry:{type:'LineString',coordinates:[[85,23],[86,24]]}};
@@ -91,14 +105,26 @@ try {
   const offRoute=evaluate(shipment,recovered.state,configs,offPacket,offPacket.timestamp,{route});
   assert(offRoute.alerts.some(alert=>alert.code==='OR'));
   await deliver(offRoute,offPacket);
+  let progressing=offRoute;
+  for(const [offset,longitude] of [[181000,85.62],[182000,85.64],[183000,85.66]]){
+    const sample={...offPacket,timestamp:now+offset,longitude};
+    progressing=evaluate(shipment,progressing.state,configs,sample,sample.timestamp,{route});
+    await deliver(progressing,sample);
+  }
   const onPacket={...packet,timestamp:now+240000,speed:20};
-  const onRoute=evaluate(shipment,offRoute.state,configs,onPacket,onPacket.timestamp,{route});
+  const onRoute=evaluate(shipment,progressing.state,configs,onPacket,onPacket.timestamp,{route});
   const recovery=onRoute.alerts.find(alert=>alert.code==='ON_ROUTE');assert(recovery);
   await deliver(onRoute,onPacket);
   const [onDetails]=await connection.execute('SELECT off_route,alert_event_id FROM tbl_vehicle_alerts_details WHERE event_key=?',[recovery.event_key]);
   assert.equal(onDetails[0].off_route,'ON_ROUTE');assert(onDetails[0].alert_event_id);
   const [closedRoute]=await connection.execute('SELECT status,end_date_time FROM tbl_vehicle_alert_event WHERE event_key=?',[offRoute.events.find(event=>event.code==='OR').event_key]);
   assert.equal(Number(closedRoute[0].status),0);assert(closedRoute[0].end_date_time);
+  const [[episode]]=await connection.execute('SELECT id FROM tbl_vehicle_alert_event WHERE event_key=?',[recovery.episode_key]);
+  assert.equal(Number(onDetails[0].alert_event_id),Number(episode.id));
+  const [[offDetails]]=await connection.execute('SELECT COUNT(*) total FROM tbl_vehicle_alerts_details WHERE alert_event_id=? AND alert_id=5',[episode.id]);
+  assert.equal(Number(offDetails.total),3);
+  const [[recoveryEvents]]=await connection.query('SELECT COUNT(*) total FROM tbl_vehicle_alert_event WHERE alert_id=16');
+  assert.equal(Number(recoveryEvents.total),0);
   for(const table of ['tbl_vehicle_alerts_details','tbl_vehicle_alert_event']){
     const [columns]=await connection.query(`SHOW COLUMNS FROM ${table}`);
     assert(!columns.some(column=>column.Field==='vehicle_id'));

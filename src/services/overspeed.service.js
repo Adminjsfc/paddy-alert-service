@@ -1,3 +1,4 @@
 export function process({active,packet,settings,at,condition}) {
-  condition('OS',active&&packet.speed>Number(settings.OS?.threshold_value??50),at);
+  const limit=Number(settings.OS?.alert_time);
+  condition('OS',active&&Number.isFinite(limit)&&limit>0&&packet.speed>limit,at);
 }

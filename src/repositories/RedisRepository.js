@@ -7,6 +7,7 @@ export class RedisRepository {
     this.lockKey=prefix+':batch_lock';
   }
   stateKey(id){return `${this.prefix}:state:${id}`;}
+  publishNotification(payload){return this.client.publish('paddy:notification:new',JSON.stringify(payload));}
   latestKey(vehicle){return `${this.prefix}:latest:${vehicle}`;}
   async getState(id){const raw=await this.client.get(this.stateKey(id));return raw?JSON.parse(raw):null;}
   async getLatestPacket(vehicle){const raw=await this.client.get(this.latestKey(vehicle));return raw?JSON.parse(raw):null;}

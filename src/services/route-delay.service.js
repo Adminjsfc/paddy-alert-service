@@ -4,12 +4,18 @@ import {epoch} from '../config/database.js';
 export function process({active,departed,source,destination,packet,settings,at,condition,pulse,state,route}) {
   const metres=routeDistance([packet.longitude,packet.latitude],route?.geometry);
   if(active&&metres==null)return; // Missing geometry cannot prove recovery.
-  const wasOffRoute=state.conditions.OR?.sentAt!=null;
-  const onRoute=metres!=null&&metres<=Number(settings.OR?.threshold_value??200);
+  const threshold=Number(settings.OR?.alert_time);
+  if(active&&(!Number.isFinite(threshold)||threshold<=0)){
+    condition('OR',false,at);
+    return;
+  }
+  const offRouteEpisode=state.conditions.OR;
+  const wasOffRoute=offRouteEpisode?.sentAt!=null;
+  const onRoute=metres!=null&&metres<threshold;
   const fields={off_route_in_km:metres==null?null:Number((metres/1000).toFixed(3))};
   condition('OR',active&&departed&&!source&&!destination&&metres!=null&&!onRoute,at,
-    {off_route:'OFF_ROUTE',...fields});
-  if(active&&wasOffRoute&&onRoute)pulse('ON_ROUTE',at,at,{off_route:'ON_ROUTE',...fields});
+    {off_route:'OFF_ROUTE',deviation_metres:metres,...fields});
+  if(active&&wasOffRoute&&onRoute)pulse('ON_ROUTE',at,at,{episode_key:offRouteEpisode.event_key,off_route:'ON_ROUTE',...fields});
 }
 
 export function scan({shipment,active,now,condition,state}) {
